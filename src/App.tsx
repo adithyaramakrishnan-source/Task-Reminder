@@ -1,7 +1,6 @@
-import { useState, useEffect, useMemo, useRef, FormEvent } from 'react';
+import { useState, useEffect, useMemo, FormEvent } from 'react';
 import { 
   Clock, 
-  Calendar, 
   Bell, 
   BellRing, 
   Trash2, 
@@ -16,13 +15,17 @@ import {
   X, 
   CheckCircle, 
   Edit2, 
-  Info,
   CalendarDays,
   Sparkles,
-  ChevronRight
+  Laptop,
+  Download,
+  Info,
+  ShieldAlert,
+  Power
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { playSound, stopSound } from './utils/audio';
+import { syncTasksToIndexedDB, loadTasksFromIndexedDB } from './utils/db';
 import { TaskReminder, SoundType } from './types';
 
 // Local storage key
@@ -52,7 +55,7 @@ export default function App() {
         return JSON.parse(stored);
       }
     } catch (e) {
-      console.error('Failed to load reminders', e);
+      console.error('Failed to load reminders from localStorage', e);
     }
     return [];
   });
@@ -65,7 +68,6 @@ export default function App() {
   const [taskDate, setTaskDate] = useState(() => getLocalDateString(new Date()));
   const [taskTime, setTaskTime] = useState(() => {
     const now = new Date();
-    // Default to 5 minutes from now
     now.setMinutes(now.getMinutes() + 5);
     return getLocalTimeString(now);
   });
@@ -76,33 +78,81 @@ export default function App() {
   const [activeFilter, setActiveFilter] = useState<'all' | 'upcoming' | 'completed'>('all');
   const [editingReminder, setEditingReminder] = useState<TaskReminder | null>(null);
 
-  // System notification permissions
+  // System notification permissions & PWA / iFrame state
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>('default');
   const [isInIframe, setIsInIframe] = useState(false);
+  const [deferredInstallPrompt, setDeferredInstallPrompt] = useState<any>(null);
+  const [isPwaInstalled, setIsPwaInstalled] = useState(false);
+  const [swRegistered, setSwRegistered] = useState(false);
+  const [showClosedGuide, setShowClosedGuide] = useState(false);
 
   // Currently firing active alarm
   const [activeAlarm, setActiveAlarm] = useState<TaskReminder | null>(null);
   const [isPreviewingSound, setIsPreviewingSound] = useState<SoundType | null>(null);
-
-  // Track user-triggered test flag for clean visual state
   const [lastTestedTask, setLastTestedTask] = useState<string | null>(null);
 
-  // Initialize and check iframe state and notification permission
+  // Initialize Service Worker, IndexedDB, and Notification checks
   useEffect(() => {
     // Detect iframe
-    setIsInIframe(window.self !== window.top);
+    const inIframe = window.self !== window.top;
+    setIsInIframe(inIframe);
 
+    // Check notification permission
     if ('Notification' in window) {
       setNotificationPermission(Notification.permission);
     }
+
+    // Load from IndexedDB if localStorage was empty
+    loadTasksFromIndexedDB().then(dbTasks => {
+      if (dbTasks && dbTasks.length > 0 && reminders.length === 0) {
+        setReminders(dbTasks);
+      }
+    });
+
+    // Register Service Worker for background notifications when tab is closed
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js').then(reg => {
+        console.log('Background Service Worker registered successfully:', reg.scope);
+        setSwRegistered(true);
+      }).catch(err => {
+        console.warn('Service Worker registration failed (normal in restricted iframe environments):', err);
+      });
+
+      // Listen for task triggers from SW
+      navigator.serviceWorker.addEventListener('message', (event) => {
+        if (event.data && event.data.type === 'TASK_DUE') {
+          const dueTask = event.data.task;
+          setActiveAlarm(dueTask);
+          playSound(dueTask.soundType);
+        }
+      });
+    }
+
+    // Capture PWA Install Prompt
+    const handleBeforeInstall = (e: any) => {
+      e.preventDefault();
+      setDeferredInstallPrompt(e);
+    };
+
+    window.addEventListener('beforeinstallprompt', handleBeforeInstall);
+
+    // Check if running as PWA
+    if (window.matchMedia('(display-mode: standalone)').matches) {
+      setIsPwaInstalled(true);
+    }
+
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstall);
+    };
   }, []);
 
-  // Sync reminders with Local Storage
+  // Sync reminders with LocalStorage AND IndexedDB for Service Worker
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(reminders));
+    syncTasksToIndexedDB(reminders);
   }, [reminders]);
 
-  // Keep digital clock ticking every 1 second
+  // Clock tick every 1 second
   useEffect(() => {
     const timer = setInterval(() => {
       setCurrentTime(new Date());
@@ -110,19 +160,15 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
-  // System Reminder Check Engine: Runs every tick of currentTime
+  // In-App Alarm Checker Loop
   useEffect(() => {
-    if (activeAlarm) return; // Wait until current firing alarm is addressed
+    if (activeAlarm) return;
 
     const now = new Date();
-    const todayStr = getLocalDateString(now);
-    const timeStr = getLocalTimeString(now);
 
-    // Find any pending task that has reached or passed its scheduled time
     const dueReminder = reminders.find(reminder => {
       if (reminder.completed || reminder.notified) return false;
 
-      // Parse schedule
       const [sYear, sMonth, sDay] = reminder.date.split('-').map(Number);
       const [sHour, sMin] = reminder.time.split(':').map(Number);
       const scheduledDate = new Date(sYear, sMonth - 1, sDay, sHour, sMin, 0, 0);
@@ -131,36 +177,31 @@ export default function App() {
     });
 
     if (dueReminder) {
-      // 1. Instantly flag as notified in state/cache to prevent duplicate trigger loops
       setReminders(prev => prev.map(r => r.id === dueReminder.id ? { ...r, notified: true } : r));
-      
-      // 2. Open active alarm screen
       setActiveAlarm(dueReminder);
-
-      // 3. Play the looping audio synthesized in our audio engine
       playSound(dueReminder.soundType);
-
-      // 4. Fire the System Level Browser Notification
       triggerDesktopNotification(dueReminder);
     }
   }, [currentTime, reminders, activeAlarm]);
 
-  // Fire system level notification
+  // Trigger system notification
   const triggerDesktopNotification = (reminder: TaskReminder) => {
     if ('Notification' in window && Notification.permission === 'granted') {
       try {
-        const notification = new Notification(`🔔 Task Due: ${reminder.title}`, {
-          body: `Scheduled for ${reminder.time} on ${reminder.date}. Click to dismiss alarm.`,
-          tag: reminder.id,
-          requireInteraction: true,
-        });
-
-        notification.onclick = () => {
-          window.focus();
-          notification.close();
-        };
+        if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
+          navigator.serviceWorker.controller.postMessage({
+            type: 'SHOW_NOTIFICATION',
+            task: reminder
+          });
+        } else {
+          new Notification(`🔔 Task Due: ${reminder.title}`, {
+            body: `Scheduled for ${reminder.time} on ${reminder.date}. Click to dismiss alarm.`,
+            tag: reminder.id,
+            requireInteraction: true,
+          });
+        }
       } catch (err) {
-        console.warn('Notification API crashed, falling back to fully-featured in-app alert.', err);
+        console.warn('Desktop notification triggered fallback.', err);
       }
     }
   };
@@ -177,13 +218,31 @@ export default function App() {
       setNotificationPermission(permission);
 
       if (permission === 'granted') {
-        // Send a celebratory confirmation pop-up
         new Notification('Reminders Connected! 🔔', {
-          body: 'You will now receive system notifications on your laptop when tasks are due.',
+          body: 'System notifications are now active on your laptop.',
         });
       }
     } catch (err) {
-      console.error('Error requesting notification permissions', err);
+      console.error('Error requesting notification permission', err);
+    }
+  };
+
+  // Open App in Standalone Tab / New Window
+  const handleOpenNewTab = () => {
+    window.open(window.location.href, '_blank', 'noopener,noreferrer');
+  };
+
+  // Install Desktop App (PWA)
+  const handleInstallPWA = async () => {
+    if (deferredInstallPrompt) {
+      deferredInstallPrompt.prompt();
+      const choiceResult = await deferredInstallPrompt.userChoice;
+      if (choiceResult.outcome === 'accepted') {
+        setIsPwaInstalled(true);
+      }
+      setDeferredInstallPrompt(null);
+    } else {
+      setShowClosedGuide(true);
     }
   };
 
@@ -195,14 +254,12 @@ export default function App() {
     } else {
       playSound(type);
       setIsPreviewingSound(type);
-      // Automatically stop preview sound after 2.5s for bells/chimes or if user leaves it
       setTimeout(() => {
         setIsPreviewingSound(prev => prev === type ? null : prev);
       }, 2500);
     }
   };
 
-  // Stop any active preview on form submit or changes
   const clearSoundPreview = () => {
     if (isPreviewingSound) {
       stopSound();
@@ -210,7 +267,7 @@ export default function App() {
     }
   };
 
-  // Form submission: Create or Update Task
+  // Form submission: Save task
   const handleSaveReminder = (e: FormEvent) => {
     e.preventDefault();
     if (!taskTitle.trim()) return;
@@ -218,7 +275,6 @@ export default function App() {
     clearSoundPreview();
 
     if (editingReminder) {
-      // Update existing
       setReminders(prev => prev.map(r => r.id === editingReminder.id ? {
         ...r,
         title: taskTitle.trim(),
@@ -226,12 +282,11 @@ export default function App() {
         time: taskTime,
         dateTimeString: `${taskDate} ${taskTime}`,
         soundType,
-        completed: false, // Reset completion when rescheduling
-        notified: false,  // Reset notification flag to fire again
+        completed: false,
+        notified: false,
       } : r));
       setEditingReminder(null);
     } else {
-      // Add new
       const newReminder: TaskReminder = {
         id: Math.random().toString(36).substring(2, 9),
         title: taskTitle.trim(),
@@ -246,15 +301,13 @@ export default function App() {
       setReminders(prev => [newReminder, ...prev]);
     }
 
-    // Reset fields
     setTaskTitle('');
-    // Set default time to 5 minutes in future
     const defaultFuture = new Date();
     defaultFuture.setMinutes(defaultFuture.getMinutes() + 5);
     setTaskTime(getLocalTimeString(defaultFuture));
   };
 
-  // Quick Preset Adders (e.g. +1 Min, +2 Min, +5 Min)
+  // Quick Preset Adders
   const addQuickPreset = (minutes: number) => {
     clearSoundPreview();
     const futureTime = new Date();
@@ -278,13 +331,12 @@ export default function App() {
     setReminders(prev => [newReminder, ...prev]);
     setLastTestedTask(newReminder.id);
 
-    // Auto clear last tested notification banner highlight after 4 seconds
     setTimeout(() => {
       setLastTestedTask(null);
     }, 4000);
   };
 
-  // Alarm Handle Action: Dismiss & Mark Complete
+  // Alarm Actions
   const handleDismissComplete = () => {
     if (!activeAlarm) return;
     stopSound();
@@ -292,7 +344,6 @@ export default function App() {
     setActiveAlarm(null);
   };
 
-  // Alarm Handle Action: Snooze
   const handleSnooze = (minutes: number) => {
     if (!activeAlarm) return;
     stopSound();
@@ -310,7 +361,7 @@ export default function App() {
           date: snoozedDate,
           time: snoozedTime,
           dateTimeString: `${snoozedDate} ${snoozedTime}`,
-          notified: false, // reset so it will fire again
+          notified: false,
           completed: false,
         };
       }
@@ -320,18 +371,15 @@ export default function App() {
     setActiveAlarm(null);
   };
 
-  // Alarm Handle Action: Stop sound, leave pending
   const handleStopOnly = () => {
     stopSound();
     setActiveAlarm(null);
   };
 
-  // Toggle complete manually in list
   const toggleComplete = (id: string) => {
     setReminders(prev => prev.map(r => r.id === id ? { ...r, completed: !r.completed } : r));
   };
 
-  // Delete reminder
   const deleteReminder = (id: string) => {
     clearSoundPreview();
     setReminders(prev => prev.filter(r => r.id !== id));
@@ -341,7 +389,6 @@ export default function App() {
     }
   };
 
-  // Populate form to edit reminder
   const startEditing = (reminder: TaskReminder) => {
     clearSoundPreview();
     setEditingReminder(reminder);
@@ -352,7 +399,6 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  // Cancel editing mode
   const cancelEditing = () => {
     setEditingReminder(null);
     setTaskTitle('');
@@ -361,22 +407,17 @@ export default function App() {
     setTaskTime(getLocalTimeString(now));
   };
 
-  // Filtered and searched reminders list
+  // Filtered & Searched Tasks
   const filteredReminders = useMemo(() => {
     return reminders.filter(reminder => {
       const matchesSearch = reminder.title.toLowerCase().includes(searchQuery.toLowerCase());
-      
-      if (activeFilter === 'completed') {
-        return matchesSearch && reminder.completed;
-      }
-      if (activeFilter === 'upcoming') {
-        return matchesSearch && !reminder.completed;
-      }
+      if (activeFilter === 'completed') return matchesSearch && reminder.completed;
+      if (activeFilter === 'upcoming') return matchesSearch && !reminder.completed;
       return matchesSearch;
     });
   }, [reminders, activeFilter, searchQuery]);
 
-  // Statistics calculation
+  // Statistics
   const stats = useMemo(() => {
     const total = reminders.length;
     const completed = reminders.filter(r => r.completed).length;
@@ -384,7 +425,7 @@ export default function App() {
     return { total, completed, upcoming };
   }, [reminders]);
 
-  // Clock formatter for visual display
+  // Clock display
   const clockDisplay = useMemo(() => {
     const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
     const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -397,7 +438,7 @@ export default function App() {
     let hours = currentTime.getHours();
     const ampm = hours >= 12 ? 'PM' : 'AM';
     hours = hours % 12;
-    hours = hours ? hours : 12; // conversion of 0 to 12
+    hours = hours ? hours : 12;
     const mins = String(currentTime.getMinutes()).padStart(2, '0');
     const secs = String(currentTime.getSeconds()).padStart(2, '0');
     
@@ -413,28 +454,47 @@ export default function App() {
       
       {/* HEADER SECTION */}
       <header className="border-b border-slate-200 bg-white shadow-xs">
-        <div className="mx-auto max-w-6xl px-4 py-5 sm:px-6">
+        <div className="mx-auto max-w-6xl px-4 py-4 sm:px-6">
           <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-            {/* Title Block */}
+            {/* App Title */}
             <div className="flex items-center gap-3">
-              <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-indigo-600 text-white shadow-md shadow-indigo-100">
-                <Bell className="h-6 w-6 animate-pulse" />
+              <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-indigo-600 text-white shadow-md shadow-indigo-100">
+                <Bell className="h-5 w-5 animate-pulse" />
               </div>
               <div>
-                <h1 className="text-2xl font-bold tracking-tight text-slate-900">Task Reminders</h1>
-                <p className="text-xs text-slate-500">System alert & sound notifications for your scheduled workflow</p>
+                <h1 className="text-xl font-bold tracking-tight text-slate-900">Task Reminders</h1>
+                <p className="text-xs text-slate-500">System alert & audio alarms for your workflow</p>
               </div>
             </div>
 
-            {/* Glowing Monospace Clock Widget */}
-            <div className="flex items-center gap-3 rounded-2xl border border-indigo-50 bg-indigo-50/40 p-3 pr-4">
-              <Clock className="h-5 w-5 text-indigo-600" />
-              <div className="text-right">
-                <div className="font-mono text-lg font-bold tracking-wider text-indigo-950">
-                  {clockDisplay.timeString} <span className="text-xs font-semibold text-indigo-600">{clockDisplay.ampm}</span>
-                </div>
-                <div className="text-[10px] font-medium tracking-wide text-slate-500 uppercase">
-                  {clockDisplay.dateString}
+            {/* Header Right Actions & Clock */}
+            <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+              {/* Open in Standalone Tab Button */}
+              <button
+                onClick={handleOpenNewTab}
+                className="flex items-center gap-1.5 rounded-xl border border-indigo-200 bg-indigo-50/60 hover:bg-indigo-100 px-3 py-2 text-xs font-semibold text-indigo-700 transition-all cursor-pointer shadow-2xs active:scale-95"
+                title="Open app in a full browser tab for system permissions"
+              >
+                <ExternalLink className="h-3.5 w-3.5" />
+                <span>Open in Standalone Tab</span>
+              </button>
+
+              {/* Closed Window Guide Modal Trigger */}
+              <button
+                onClick={() => setShowClosedGuide(true)}
+                className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50 hover:bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-700 transition-all cursor-pointer shadow-2xs"
+              >
+                <Laptop className="h-3.5 w-3.5 text-indigo-600" />
+                <span>Closed Window Guide</span>
+              </button>
+
+              {/* Clock Widget */}
+              <div className="flex items-center gap-2.5 rounded-xl border border-slate-200 bg-slate-900 text-white px-3 py-1.5 shadow-2xs">
+                <Clock className="h-4 w-4 text-indigo-400" />
+                <div className="text-right">
+                  <div className="font-mono text-sm font-bold tracking-wider">
+                    {clockDisplay.timeString} <span className="text-[10px] text-indigo-400">{clockDisplay.ampm}</span>
+                  </div>
                 </div>
               </div>
             </div>
@@ -442,72 +502,85 @@ export default function App() {
         </div>
       </header>
 
-      {/* CORE ALERTS & HELP BAR */}
-      <div className="mx-auto max-w-6xl px-4 pt-6 sm:px-6">
+      {/* SYSTEM PERMISSION & IFRAME ACTION BANNERS */}
+      <div className="mx-auto max-w-6xl px-4 pt-5 sm:px-6">
         
-        {/* Permission and Iframe Constraints Warning */}
-        <AnimatePresence mode="wait">
-          {notificationPermission !== 'granted' && (
-            <motion.div 
-              initial={{ opacity: 0, y: -10 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -10 }}
-              className="mb-6 overflow-hidden rounded-2xl border border-amber-200 bg-amber-50/80 p-4 shadow-xs"
-            >
-              <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-                <div className="flex items-start gap-3">
-                  <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-amber-600" />
-                  <div>
-                    <h3 className="font-semibold text-amber-900 text-sm">Enable Laptop System Notifications</h3>
-                    <p className="mt-1 text-xs text-amber-700 leading-relaxed">
-                      To make reminders pop up directly on your desktop notification center (even when working in other tabs), please allow browser notifications.
-                      {isInIframe && (
-                        <span className="block mt-1 font-medium text-amber-800">
-                          💡 <strong>Notice:</strong> You are currently viewing this in an iframe frame. For security, browsers block system notification permission queries inside iframes. <strong>Click 'Open in New Tab' in the top right menu</strong> to authorize and receive real pop-ups!
-                        </span>
-                      )}
-                    </p>
-                  </div>
+        {/* Banner 1: If inside iFrame, provide 1-click Standalone tab button */}
+        {isInIframe && (
+          <div className="mb-4 overflow-hidden rounded-2xl border border-amber-300 bg-amber-50/90 p-4 shadow-2xs">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex items-start gap-3">
+                <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-amber-600" />
+                <div>
+                  <h3 className="font-bold text-amber-950 text-sm">Action Needed for System Popups</h3>
+                  <p className="mt-0.5 text-xs text-amber-800 leading-relaxed">
+                    You are currently viewing this inside an <strong>AI Studio iFrame preview</strong>. Web browsers block system notification permission popups inside embedded frames.
+                  </p>
                 </div>
-                {!isInIframe && (
-                  <button
-                    onClick={requestNotificationPermission}
-                    className="flex shrink-0 items-center justify-center gap-1.5 rounded-lg bg-amber-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-amber-700 transition-all cursor-pointer active:scale-95"
-                  >
-                    <BellRing className="h-4 w-4" />
-                    Allow System Popups
-                  </button>
-                )}
               </div>
-            </motion.div>
-          )}
-
-          {notificationPermission === 'granted' && (
-            <motion.div
-              initial={{ opacity: 0, scale: 0.98 }}
-              animate={{ opacity: 1, scale: 1 }}
-              className="mb-6 flex items-center justify-between rounded-xl border border-emerald-100 bg-emerald-50/60 px-4 py-2.5"
-            >
-              <div className="flex items-center gap-2 text-emerald-800 text-xs">
-                <span className="flex h-2.5 w-2.5 rounded-full bg-emerald-500 animate-ping" />
-                <span className="font-semibold text-emerald-900">Desktop Push Notifications Enabled</span>
-                <span>• Reminders will trigger system level OS popups on your laptop!</span>
-              </div>
-              <button 
-                onClick={() => {
-                  if ('Notification' in window) {
-                    new Notification('Reminders Test! 🔔', {
-                      body: 'This is an instant check to verify that system notifications are reaching your OS screen.',
-                    });
-                  }
-                }}
-                className="text-[11px] font-medium text-emerald-700 hover:text-emerald-900 underline underline-offset-2"
+              <button
+                onClick={handleOpenNewTab}
+                className="flex shrink-0 items-center justify-center gap-2 rounded-xl bg-amber-600 px-4 py-2.5 text-xs font-bold text-white hover:bg-amber-700 shadow-xs transition-all cursor-pointer active:scale-95"
               >
-                Send Quick Test
+                <ExternalLink className="h-4 w-4" />
+                Open Standalone App Tab
               </button>
-            </motion.div>
-          )}
-        </AnimatePresence>
+            </div>
+          </div>
+        )}
+
+        {/* Banner 2: Permission request if not granted and not in iframe */}
+        {!isInIframe && notificationPermission !== 'granted' && (
+          <div className="mb-4 rounded-2xl border border-indigo-200 bg-indigo-50/80 p-4 shadow-2xs">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex items-start gap-3">
+                <BellRing className="mt-0.5 h-5 w-5 shrink-0 text-indigo-600" />
+                <div>
+                  <h3 className="font-bold text-indigo-950 text-sm">Enable Laptop System Notifications</h3>
+                  <p className="mt-0.5 text-xs text-indigo-800">
+                    Allow notifications so reminders pop up directly on your desktop screen even when working in other apps.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={requestNotificationPermission}
+                className="flex shrink-0 items-center justify-center gap-1.5 rounded-xl bg-indigo-600 px-4 py-2 text-xs font-semibold text-white hover:bg-indigo-700 transition-all cursor-pointer"
+              >
+                <Bell className="h-4 w-4" />
+                Allow Laptop Popups
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Banner 3: Closed Window Notification Capability status */}
+        <div className="mb-6 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-emerald-200/80 bg-emerald-50/60 px-4 py-2.5">
+          <div className="flex items-center gap-2 text-xs text-emerald-900">
+            <span className="flex h-2.5 w-2.5 rounded-full bg-emerald-500 animate-pulse" />
+            <span className="font-bold">Background Sync Engine Ready</span>
+            <span className="text-slate-500 hidden md:inline">• Service Worker registered for laptop background alerts.</span>
+          </div>
+
+          <div className="flex items-center gap-3">
+            {deferredInstallPrompt && (
+              <button
+                onClick={handleInstallPWA}
+                className="flex items-center gap-1 text-xs font-bold text-indigo-700 hover:text-indigo-900 bg-indigo-100 hover:bg-indigo-200 px-2.5 py-1 rounded-lg transition-all"
+              >
+                <Download className="h-3.5 w-3.5" />
+                Install Desktop App
+              </button>
+            )}
+
+            <button
+              onClick={() => setShowClosedGuide(true)}
+              className="text-[11px] font-semibold text-slate-600 hover:text-indigo-700 underline underline-offset-2 cursor-pointer"
+            >
+              How do notifications work when window is closed?
+            </button>
+          </div>
+        </div>
+
       </div>
 
       {/* MAIN CONTAINER */}
@@ -515,15 +588,15 @@ export default function App() {
         
         {/* STATS OVERVIEW CARDS */}
         <div className="grid grid-cols-3 gap-3 sm:gap-4 mb-6">
-          <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-xs">
+          <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-2xs">
             <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Total Reminders</p>
             <p className="mt-1 text-2xl font-bold text-slate-800">{stats.total}</p>
           </div>
-          <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-xs">
+          <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-2xs">
             <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Pending Alerts</p>
             <p className="mt-1 text-2xl font-bold text-indigo-600">{stats.upcoming}</p>
           </div>
-          <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-xs">
+          <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-2xs">
             <p className="text-[11px] font-semibold uppercase tracking-wider text-emerald-500">Completed</p>
             <p className="mt-1 text-2xl font-bold text-emerald-600">{stats.completed}</p>
           </div>
@@ -533,7 +606,7 @@ export default function App() {
           
           {/* LEFT SIDE: ADD & CONFIG FORM */}
           <section className="lg:col-span-5 space-y-6">
-            <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-xs">
+            <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-2xs">
               <div className="flex items-center justify-between border-b border-slate-100 pb-3 mb-4">
                 <div className="flex items-center gap-2">
                   <Sparkles className="h-4 w-4 text-indigo-500" />
@@ -544,7 +617,7 @@ export default function App() {
                 {editingReminder && (
                   <button 
                     onClick={cancelEditing}
-                    className="text-xs text-slate-400 hover:text-slate-600"
+                    className="text-xs text-slate-400 hover:text-slate-600 cursor-pointer"
                   >
                     Cancel Edit
                   </button>
@@ -554,37 +627,35 @@ export default function App() {
               <form onSubmit={handleSaveReminder} className="space-y-4">
                 {/* Title */}
                 <div>
-                  <label htmlFor="task-name" className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1.5">
-                    Task Reminder Title
+                  <label htmlFor="task-title" className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1.5">
+                    Task Name / Reminder
                   </label>
                   <input
-                    id="task-name"
+                    id="task-title"
                     type="text"
                     required
                     value={taskTitle}
                     onChange={(e) => setTaskTitle(e.target.value)}
-                    placeholder="e.g. Call Client, Standup meeting, Drink water..."
+                    placeholder="e.g. Call Client, Standup meeting, Take medication..."
                     className="w-full rounded-xl border border-slate-200 px-3.5 py-2.5 text-sm outline-none transition-all focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100"
                   />
                 </div>
 
-                {/* Date & Time Input Grid */}
+                {/* Date & Time Grid */}
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <label htmlFor="task-date" className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1.5">
                       Select Date
                     </label>
-                    <div className="relative">
-                      <input
-                        id="task-date"
-                        type="date"
-                        required
-                        value={taskDate}
-                        min={getLocalDateString(new Date())}
-                        onChange={(e) => setTaskDate(e.target.value)}
-                        className="w-full rounded-xl border border-slate-200 pl-3.5 pr-2 py-2.5 text-sm outline-none transition-all focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100"
-                      />
-                    </div>
+                    <input
+                      id="task-date"
+                      type="date"
+                      required
+                      value={taskDate}
+                      min={getLocalDateString(new Date())}
+                      onChange={(e) => setTaskDate(e.target.value)}
+                      className="w-full rounded-xl border border-slate-200 px-3.5 py-2.5 text-sm outline-none transition-all focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100"
+                    />
                   </div>
 
                   <div>
@@ -602,7 +673,7 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Sound preset select and preview */}
+                {/* Sound Preset Picker */}
                 <div>
                   <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">
                     Alarm Sound Preset
@@ -610,7 +681,7 @@ export default function App() {
                   <div className="grid grid-cols-2 gap-2">
                     {[
                       { id: 'digital', label: 'Beep Beep', desc: 'Digital Alarm' },
-                      { id: 'classic', label: 'Vintage Bell', desc: 'Mechanical Telephone' },
+                      { id: 'classic', label: 'Vintage Bell', desc: 'Mechanical Ring' },
                       { id: 'bell', label: 'Crystal Bell', desc: 'Decaying Strike' },
                       { id: 'gentle', label: 'Ambient Sweep', desc: 'Soothing Chord' }
                     ].map((sound) => (
@@ -671,33 +742,33 @@ export default function App() {
               </form>
             </div>
 
-            {/* QUICK PRESETS BOX FOR RAPID TESTING */}
+            {/* QUICK PRESET TESTER */}
             <div className="rounded-2xl border border-indigo-100 bg-indigo-50/30 p-5">
               <div className="flex items-center gap-1.5 mb-2">
                 <Sparkles className="h-4 w-4 text-indigo-600" />
                 <h3 className="text-xs font-bold uppercase tracking-wider text-indigo-950">Quick One-Click Tester</h3>
               </div>
               <p className="text-xs text-slate-500 mb-3.5 leading-relaxed">
-                Add an immediate trial reminder in exactly 1 or 2 minutes to verify system volume and notifications on your laptop screen.
+                Add an immediate trial reminder in 1 or 2 minutes to test sound and desktop notification delivery.
               </p>
               <div className="grid grid-cols-3 gap-2">
                 <button
                   onClick={() => addQuickPreset(1)}
-                  className="flex items-center justify-center gap-1 rounded-xl bg-white border border-indigo-100 hover:border-indigo-400 px-2 py-2.5 text-xs font-semibold text-indigo-700 shadow-2xs hover:shadow-sm transition-all cursor-pointer active:scale-95"
+                  className="flex items-center justify-center gap-1 rounded-xl bg-white border border-indigo-100 hover:border-indigo-400 px-2 py-2.5 text-xs font-semibold text-indigo-700 shadow-2xs transition-all cursor-pointer active:scale-95"
                 >
                   <Plus className="h-3 w-3" />
                   In 1 min
                 </button>
                 <button
                   onClick={() => addQuickPreset(2)}
-                  className="flex items-center justify-center gap-1 rounded-xl bg-white border border-indigo-100 hover:border-indigo-400 px-2 py-2.5 text-xs font-semibold text-indigo-700 shadow-2xs hover:shadow-sm transition-all cursor-pointer active:scale-95"
+                  className="flex items-center justify-center gap-1 rounded-xl bg-white border border-indigo-100 hover:border-indigo-400 px-2 py-2.5 text-xs font-semibold text-indigo-700 shadow-2xs transition-all cursor-pointer active:scale-95"
                 >
                   <Plus className="h-3 w-3" />
                   In 2 min
                 </button>
                 <button
                   onClick={() => addQuickPreset(5)}
-                  className="flex items-center justify-center gap-1 rounded-xl bg-white border border-indigo-100 hover:border-indigo-400 px-2 py-2.5 text-xs font-semibold text-indigo-700 shadow-2xs hover:shadow-sm transition-all cursor-pointer active:scale-95"
+                  className="flex items-center justify-center gap-1 rounded-xl bg-white border border-indigo-100 hover:border-indigo-400 px-2 py-2.5 text-xs font-semibold text-indigo-700 shadow-2xs transition-all cursor-pointer active:scale-95"
                 >
                   <Plus className="h-3 w-3" />
                   In 5 min
@@ -710,9 +781,8 @@ export default function App() {
           <section className="lg:col-span-7 space-y-4">
             
             {/* Filter & Search Bar */}
-            <div className="flex flex-col gap-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-xs sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex flex-col gap-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-2xs sm:flex-row sm:items-center sm:justify-between">
               
-              {/* Filter pills */}
               <div className="flex bg-slate-100 rounded-lg p-0.5 self-start sm:self-auto">
                 <button
                   onClick={() => setActiveFilter('all')}
@@ -746,7 +816,6 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Search */}
               <div className="relative flex-1 max-w-sm">
                 <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
                 <input
@@ -795,7 +864,6 @@ export default function App() {
                       >
                         <div className="flex items-start justify-between gap-3">
                           <div className="flex items-start gap-3">
-                            {/* Complete Tick Box */}
                             <button
                               onClick={() => toggleComplete(reminder.id)}
                               className={`mt-1 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-all cursor-pointer ${
@@ -809,7 +877,6 @@ export default function App() {
                               {reminder.completed && <Check className="h-3.5 w-3.5 stroke-[3]" />}
                             </button>
 
-                            {/* Task Info details */}
                             <div>
                               <h3 className={`text-sm font-semibold tracking-tight text-slate-800 ${
                                 reminder.completed ? 'line-through text-slate-400' : ''
@@ -818,12 +885,10 @@ export default function App() {
                               </h3>
                               
                               <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-slate-400 text-[11px]">
-                                {/* Scheduled date */}
                                 <span className="flex items-center gap-1 font-medium">
                                   <CalendarDays className="h-3 w-3 text-slate-400" />
                                   {reminder.date}
                                 </span>
-                                {/* Scheduled time */}
                                 <span className={`flex items-center gap-1 font-mono font-semibold ${
                                   reminder.completed 
                                     ? 'text-slate-400' 
@@ -834,7 +899,6 @@ export default function App() {
                                   <Clock className="h-3 w-3" />
                                   {reminder.time}
                                 </span>
-                                {/* Sound chosen */}
                                 <span className="flex items-center gap-1 bg-slate-100 px-1.5 py-0.5 rounded text-slate-500 capitalize text-[9px]">
                                   <Volume2 className="h-2.5 w-2.5 text-slate-400" />
                                   {reminder.soundType} sound
@@ -843,9 +907,7 @@ export default function App() {
                             </div>
                           </div>
 
-                          {/* Action Controls */}
                           <div className="flex items-center gap-1.5 shrink-0">
-                            {/* Status Pill */}
                             <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold tracking-wide uppercase ${
                               reminder.completed
                                 ? 'bg-emerald-100 text-emerald-800'
@@ -856,11 +918,9 @@ export default function App() {
                               {reminder.completed ? 'Completed' : isOverdue ? 'Overdue' : 'Upcoming'}
                             </span>
 
-                            {/* Trigger Immediate Alarm Simulation (Perfect helper for checking laptop volume) */}
                             {!reminder.completed && (
                               <button
                                 onClick={() => {
-                                  // Immediate alarm sound test
                                   playSound(reminder.soundType);
                                   setActiveAlarm(reminder);
                                 }}
@@ -871,7 +931,6 @@ export default function App() {
                               </button>
                             )}
 
-                            {/* Edit Button */}
                             {!reminder.completed && (
                               <button
                                 onClick={() => startEditing(reminder)}
@@ -882,7 +941,6 @@ export default function App() {
                               </button>
                             )}
 
-                            {/* Delete Button */}
                             <button
                               onClick={() => deleteReminder(reminder.id)}
                               className="flex h-7 w-7 items-center justify-center rounded-lg hover:bg-rose-50 text-slate-400 hover:text-rose-600 transition-all cursor-pointer"
@@ -907,8 +965,8 @@ export default function App() {
                     <h3 className="mt-4 font-semibold text-slate-700">No Reminders Found</h3>
                     <p className="mt-1 text-xs text-slate-400 max-w-sm">
                       {searchQuery 
-                        ? 'No tasks match your current search queries. Try clearing parameters!' 
-                        : 'You do not have any reminders set up yet. Use the form on the left to set a reminder or trigger a 1-minute quick test!'}
+                        ? 'No tasks match your current search queries.' 
+                        : 'You do not have any reminders set up yet. Add a reminder above to get started!'}
                     </p>
                   </motion.div>
                 )}
@@ -917,6 +975,84 @@ export default function App() {
           </section>
         </div>
       </main>
+
+      {/* MODAL: CLOSED WINDOW NOTIFICATION GUIDE */}
+      <AnimatePresence>
+        {showClosedGuide && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 backdrop-blur-xs p-4"
+          >
+            <motion.div
+              initial={{ scale: 0.95, y: 10 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 10 }}
+              className="relative w-full max-w-lg overflow-hidden rounded-3xl bg-white p-6 shadow-2xl border border-slate-200 text-slate-900"
+            >
+              <div className="flex items-center justify-between border-b border-slate-100 pb-4">
+                <div className="flex items-center gap-2">
+                  <Laptop className="h-5 w-5 text-indigo-600" />
+                  <h3 className="font-bold text-slate-900">How to Receive Reminders When Window is Closed</h3>
+                </div>
+                <button
+                  onClick={() => setShowClosedGuide(false)}
+                  className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+
+              <div className="mt-4 space-y-4 text-xs text-slate-600 leading-relaxed">
+                <p>
+                  When a web browser tab or window is completely terminated, standard client-side scripts pause execution. Here are 3 ways to ensure you never miss a reminder:
+                </p>
+
+                <div className="rounded-2xl border border-indigo-100 bg-indigo-50/50 p-3.5 space-y-2">
+                  <div className="flex items-center gap-2 font-bold text-indigo-950">
+                    <span className="flex h-5 w-5 items-center justify-center rounded-full bg-indigo-600 text-white text-[10px]">1</span>
+                    <span>Open in Standalone Browser Tab</span>
+                  </div>
+                  <p className="pl-7 text-slate-600">
+                    Click <strong>"Open in Standalone Tab"</strong> at the top. Allow browser notification permissions once in the standalone tab so your OS can deliver desktop popups.
+                  </p>
+                </div>
+
+                <div className="rounded-2xl border border-indigo-100 bg-indigo-50/50 p-3.5 space-y-2">
+                  <div className="flex items-center gap-2 font-bold text-indigo-950">
+                    <span className="flex h-5 w-5 items-center justify-center rounded-full bg-indigo-600 text-white text-[10px]">2</span>
+                    <span>Background Service Worker Engine</span>
+                  </div>
+                  <p className="pl-7 text-slate-600">
+                    This app includes a registered <strong>Background Service Worker</strong> and <strong>IndexedDB database</strong>. As long as your browser (Chrome/Edge/Brave/Safari) is open in the background, notifications will trigger even if this specific tab is closed!
+                  </p>
+                </div>
+
+                <div className="rounded-2xl border border-indigo-100 bg-indigo-50/50 p-3.5 space-y-2">
+                  <div className="flex items-center gap-2 font-bold text-indigo-950">
+                    <span className="flex h-5 w-5 items-center justify-center rounded-full bg-indigo-600 text-white text-[10px]">3</span>
+                    <span>Install as Laptop Desktop App (PWA)</span>
+                  </div>
+                  <p className="pl-7 text-slate-600">
+                    Click the <strong>Install Desktop App</strong> button or use your browser's address bar icon (Install Task Reminders) to add this app to your Windows/Mac Dock or Start Menu as a native desktop application.
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-6 flex justify-end gap-2">
+                <button
+                  onClick={handleOpenNewTab}
+                  className="flex items-center gap-1.5 rounded-xl bg-indigo-600 px-4 py-2.5 text-xs font-bold text-white hover:bg-indigo-700 transition-all cursor-pointer"
+                >
+                  <ExternalLink className="h-3.5 w-3.5" />
+                  Open Standalone App Now
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* FULL-SCREEN ACTIVE ALARM DIALOG OVERLAY */}
       <AnimatePresence>
@@ -933,14 +1069,12 @@ export default function App() {
               exit={{ scale: 0.9, y: 20 }}
               className="relative w-full max-w-md overflow-hidden rounded-3xl border border-indigo-500/20 bg-slate-900 text-white p-6 shadow-2xl shadow-indigo-950/50"
             >
-              {/* Animated Alarm Rings / Radiating Waves */}
               <div className="absolute top-0 left-1/2 -translate-x-1/2 h-1/2 w-full flex items-center justify-center overflow-hidden pointer-events-none">
                 <div className="absolute h-48 w-48 rounded-full border border-indigo-500/10 animate-ping" />
                 <div className="absolute h-36 w-36 rounded-full border border-indigo-500/20 animate-ping [animation-delay:0.3s]" />
                 <div className="absolute h-24 w-24 rounded-full border border-indigo-500/30 animate-ping [animation-delay:0.6s]" />
               </div>
 
-              {/* Icon & Title */}
               <div className="relative text-center mt-6">
                 <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-indigo-600/30 border border-indigo-500 text-indigo-400 animate-bounce">
                   <BellRing className="h-8 w-8" />
@@ -959,15 +1093,12 @@ export default function App() {
                 </p>
               </div>
 
-              {/* Sound preset notice */}
               <div className="relative mt-4 flex items-center justify-center gap-1.5 text-xs text-slate-400 bg-slate-800/40 py-1.5 px-3 rounded-lg w-max mx-auto">
                 <Volume2 className="h-3.5 w-3.5 text-indigo-400" />
                 <span>Ringing <strong>{activeAlarm.soundType}</strong> sound...</span>
               </div>
 
-              {/* Big Responsive Action Controls */}
               <div className="relative mt-8 space-y-3">
-                {/* Dismiss & Mark Complete */}
                 <button
                   onClick={handleDismissComplete}
                   className="flex w-full items-center justify-center gap-2 rounded-2xl bg-emerald-600 hover:bg-emerald-500 px-4 py-3.5 font-semibold text-white shadow-lg shadow-emerald-950/40 transition-all cursor-pointer active:scale-98"
@@ -976,7 +1107,6 @@ export default function App() {
                   Dismiss & Mark Completed
                 </button>
 
-                {/* Snooze Options Grid */}
                 <div className="grid grid-cols-2 gap-2">
                   <button
                     onClick={() => handleSnooze(5)}
@@ -992,7 +1122,6 @@ export default function App() {
                   </button>
                 </div>
 
-                {/* Stop Sound But Keep Task Active */}
                 <button
                   onClick={handleStopOnly}
                   className="flex w-full items-center justify-center gap-1 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300 transition-all cursor-pointer py-2.5"
