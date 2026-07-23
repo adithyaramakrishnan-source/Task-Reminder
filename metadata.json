@@ -1,0 +1,6 @@
+{
+  "name": "Task Reminders",
+  "description": "Set and manage tasks with browser notifications and synthesized audio alarms to remind you right on your system.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
