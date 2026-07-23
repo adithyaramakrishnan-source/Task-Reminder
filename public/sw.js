@@ -1,4 +1,4 @@
-// Task Reminders Background Service Worker
+// Task Reminders Background Service Worker with Web Push API
 const DB_NAME = 'TaskRemindersDB';
 const DB_VERSION = 1;
 const STORE_NAME = 'reminders';
@@ -51,7 +51,7 @@ async function updateTaskInDB(task) {
   }
 }
 
-// Check for due reminders
+// Check for due reminders from local IndexedDB
 async function checkScheduledReminders() {
   const tasks = await getAllTasks();
   const now = new Date();
@@ -64,11 +64,9 @@ async function checkScheduledReminders() {
     const scheduledDate = new Date(sYear, sMonth - 1, sDay, sHour, sMin, 0, 0);
 
     if (now.getTime() >= scheduledDate.getTime()) {
-      // Mark notified in DB immediately
       task.notified = true;
       await updateTaskInDB(task);
 
-      // Trigger laptop system notification from background service worker
       if (self.registration && self.registration.showNotification) {
         try {
           await self.registration.showNotification(`🔔 Task Reminder: ${task.title}`, {
@@ -83,7 +81,6 @@ async function checkScheduledReminders() {
         }
       }
 
-      // Notify open clients if any exist
       const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
       for (const client of clients) {
         client.postMessage({ type: 'TASK_DUE', task });
@@ -106,8 +103,37 @@ self.addEventListener('activate', (event) => {
   }
 });
 
-// Periodic check trigger if active
 setInterval(checkScheduledReminders, 5000);
+
+// NATIVE WEB PUSH API EVENT HANDLER
+// Fired by the browser push manager even when web page/tab is completely closed!
+self.addEventListener('push', (event) => {
+  console.log('[SW] Web Push Notification event received!');
+  let data = {
+    title: '🔔 Scheduled Task Reminder',
+    body: 'You have a task due!',
+    tag: 'web-push-reminder',
+    soundType: 'digital'
+  };
+
+  if (event.data) {
+    try {
+      data = event.data.json();
+    } catch (err) {
+      data.body = event.data.text();
+    }
+  }
+
+  const notificationPromise = self.registration.showNotification(data.title || '🔔 Task Reminder', {
+    body: data.body || 'You have a scheduled reminder due!',
+    tag: data.tag || 'task-push-alert',
+    requireInteraction: data.requireInteraction !== undefined ? data.requireInteraction : true,
+    vibrate: [200, 100, 200, 100, 200],
+    data: data
+  });
+
+  event.waitUntil(notificationPromise);
+});
 
 // Listen to messages from frontend
 self.addEventListener('message', async (event) => {

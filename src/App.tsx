@@ -17,7 +17,6 @@ import {
   CalendarDays,
   Sparkles,
   Laptop,
-  Download,
   ShieldAlert,
   Briefcase,
   User,
@@ -26,14 +25,32 @@ import {
   Layers,
   Flag,
   RotateCcw,
-  Tag,
-  SlidersHorizontal,
   CheckCircle2,
-  Calendar
+  Radio,
+  Send,
+  Zap,
+  Key,
+  Copy,
+  Eye,
+  EyeOff,
+  Save,
+  RefreshCw,
+  Settings,
+  ShieldCheck
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { playSound, stopSound } from './utils/audio';
 import { syncTasksToIndexedDB, loadTasksFromIndexedDB } from './utils/db';
+import { 
+  checkIsPushSubscribed, 
+  subscribeUserToWebPush, 
+  unsubscribeUserFromWebPush, 
+  syncTasksWithPushServer, 
+  sendTestServerPush,
+  getVapidCredentials,
+  updateVapidCredentials,
+  VapidCredentials
+} from './utils/push';
 import { TaskReminder, SoundType, TaskCategory, TaskPriority } from './types';
 
 // Local storage key
@@ -134,15 +151,96 @@ export default function App() {
   // System notification permissions & PWA / iFrame state
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>('default');
   const [isInIframe, setIsInIframe] = useState(false);
-  const [deferredInstallPrompt, setDeferredInstallPrompt] = useState<any>(null);
   const [showClosedGuide, setShowClosedGuide] = useState(false);
+
+  // Web Push API States
+  const [isPushSubscribed, setIsPushSubscribed] = useState(false);
+  const [isSubscribingPush, setIsSubscribingPush] = useState(false);
+  const [pushStatusMessage, setPushStatusMessage] = useState<string | null>(null);
+  const [testPushLoading, setTestPushLoading] = useState(false);
+
+  // VAPID Credentials Management State
+  const [showVapidModal, setShowVapidModal] = useState(false);
+  const [showInlineVapidConfig, setShowInlineVapidConfig] = useState(false);
+  const [vapidForm, setVapidForm] = useState<VapidCredentials>({
+    publicKey: '',
+    privateKey: '',
+    subject: 'mailto:admin@taskreminders.app'
+  });
+  const [showPrivateKey, setShowPrivateKey] = useState(false);
+  const [isSavingVapid, setIsSavingVapid] = useState(false);
+  const [vapidFeedback, setVapidFeedback] = useState<{ type: 'success' | 'error'; msg: string } | null>(null);
+  const [copiedField, setCopiedField] = useState<string | null>(null);
+
+  // Fetch current VAPID credentials on load
+  useEffect(() => {
+    getVapidCredentials().then(creds => {
+      if (creds) setVapidForm(creds);
+    });
+  }, []);
+
+  const handleOpenVapidModal = async () => {
+    setVapidFeedback(null);
+    const creds = await getVapidCredentials();
+    if (creds) setVapidForm(creds);
+    setShowVapidModal(true);
+  };
+
+  const handleSaveVapidCredentials = async (e: FormEvent) => {
+    e.preventDefault();
+    setIsSavingVapid(true);
+    setVapidFeedback(null);
+
+    try {
+      const updated = await updateVapidCredentials(vapidForm);
+      setVapidForm(updated);
+      setVapidFeedback({ type: 'success', msg: 'VAPID credentials saved and applied to Express Web Push engine!' });
+      setIsPushSubscribed(false);
+    } catch (err: any) {
+      setVapidFeedback({ type: 'error', msg: err.message || 'Failed to save credentials' });
+    } finally {
+      setIsSavingVapid(false);
+    }
+  };
+
+  const handleGenerateNewKeys = async () => {
+    setIsSavingVapid(true);
+    setVapidFeedback(null);
+
+    try {
+      const updated = await updateVapidCredentials({ action: 'generate' });
+      setVapidForm(updated);
+      setVapidFeedback({ type: 'success', msg: 'New VAPID Keypair auto-generated and applied!' });
+      setIsPushSubscribed(false);
+    } catch (err: any) {
+      setVapidFeedback({ type: 'error', msg: err.message || 'Key generation failed' });
+    } finally {
+      setIsSavingVapid(false);
+    }
+  };
+
+  const handleCopyText = (text: string, fieldName: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedField(fieldName);
+    setTimeout(() => setCopiedField(null), 2500);
+  };
+
+  const handleCopyEnvBlock = () => {
+    const envBlock = `# Web Push VAPID Keys
+VAPID_PUBLIC_KEY="${vapidForm.publicKey}"
+VAPID_PRIVATE_KEY="${vapidForm.privateKey}"
+VAPID_SUBJECT="${vapidForm.subject}"`;
+    navigator.clipboard.writeText(envBlock);
+    setCopiedField('envBlock');
+    setTimeout(() => setCopiedField(null), 2500);
+  };
 
   // Currently firing active alarm
   const [activeAlarm, setActiveAlarm] = useState<TaskReminder | null>(null);
   const [isPreviewingSound, setIsPreviewingSound] = useState<SoundType | null>(null);
   const [lastTestedTask, setLastTestedTask] = useState<string | null>(null);
 
-  // Initialize Service Worker, IndexedDB, and Notification checks
+  // Initialize Service Worker, IndexedDB, Web Push & Notification checks
   useEffect(() => {
     const inIframe = window.self !== window.top;
     setIsInIframe(inIframe);
@@ -159,9 +257,12 @@ export default function App() {
 
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js').then(reg => {
-        console.log('Service Worker registered successfully:', reg.scope);
+        console.log('Service Worker registered:', reg.scope);
+        checkIsPushSubscribed().then(subscribed => {
+          setIsPushSubscribed(subscribed);
+        });
       }).catch(err => {
-        console.warn('Service Worker registration skipped (normal in restricted preview iframe):', err);
+        console.warn('Service Worker registration skipped (iframe restricted environment):', err);
       });
 
       navigator.serviceWorker.addEventListener('message', (event) => {
@@ -172,23 +273,13 @@ export default function App() {
         }
       });
     }
-
-    const handleBeforeInstall = (e: any) => {
-      e.preventDefault();
-      setDeferredInstallPrompt(e);
-    };
-
-    window.addEventListener('beforeinstallprompt', handleBeforeInstall);
-
-    return () => {
-      window.removeEventListener('beforeinstallprompt', handleBeforeInstall);
-    };
   }, []);
 
-  // Sync reminders with LocalStorage AND IndexedDB for Service Worker
+  // Sync reminders with LocalStorage, IndexedDB AND Web Push Express Server
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(reminders));
     syncTasksToIndexedDB(reminders);
+    syncTasksWithPushServer(reminders);
   }, [reminders]);
 
   // Clock tick every 1 second
@@ -240,7 +331,7 @@ export default function App() {
           });
         }
       } catch (err) {
-        console.warn('Desktop notification triggered fallback.', err);
+        console.warn('Desktop notification fallback triggered.', err);
       }
     }
   };
@@ -258,11 +349,65 @@ export default function App() {
 
       if (permission === 'granted') {
         new Notification('Reminders Connected! 🔔', {
-          body: 'System notifications are now active on your laptop.',
+          body: 'System notifications are active on your laptop.',
         });
       }
     } catch (err) {
       console.error('Error requesting notification permission', err);
+    }
+  };
+
+  // Enable/Disable Web Push API
+  const handleToggleWebPush = async () => {
+    if (isInIframe) {
+      handleOpenNewTab();
+      return;
+    }
+
+    setIsSubscribingPush(true);
+    setPushStatusMessage(null);
+
+    try {
+      if (isPushSubscribed) {
+        await unsubscribeUserFromWebPush();
+        setIsPushSubscribed(false);
+        setPushStatusMessage('Web Push unsubscribed.');
+      } else {
+        const sub = await subscribeUserToWebPush();
+        if (sub) {
+          setIsPushSubscribed(true);
+          setNotificationPermission('granted');
+          setPushStatusMessage('Web Push API active! You will receive push notifications even when the web page is completely closed.');
+          await syncTasksWithPushServer(reminders);
+        }
+      }
+    } catch (err: any) {
+      console.error('Web Push subscription error:', err);
+      setPushStatusMessage(`Web Push Error: ${err.message || 'Failed to activate Web Push.'}`);
+    } finally {
+      setIsSubscribingPush(false);
+      setTimeout(() => setPushStatusMessage(null), 6000);
+    }
+  };
+
+  // Test Server-Initiated Web Push Notification
+  const handleTestServerPush = async () => {
+    setTestPushLoading(true);
+    setPushStatusMessage(null);
+
+    try {
+      if (!isPushSubscribed) {
+        await subscribeUserToWebPush();
+        setIsPushSubscribed(true);
+      }
+
+      await sendTestServerPush();
+      setPushStatusMessage('🚀 Server Web Push sent! Check your operating system notification popups.');
+    } catch (err: any) {
+      setPushStatusMessage(`Push Test Error: ${err.message || 'Please enable Web Push first.'}`);
+    } finally {
+      setTestPushLoading(false);
+      setTimeout(() => setPushStatusMessage(null), 6000);
     }
   };
 
@@ -271,20 +416,7 @@ export default function App() {
     window.open(window.location.href, '_blank', 'noopener,noreferrer');
   };
 
-  // Install Desktop App (PWA)
-  const handleInstallPWA = async () => {
-    if (deferredInstallPrompt) {
-      deferredInstallPrompt.prompt();
-      const choiceResult = await deferredInstallPrompt.userChoice;
-      if (choiceResult.outcome === 'accepted') {
-        setDeferredInstallPrompt(null);
-      }
-    } else {
-      setShowClosedGuide(true);
-    }
-  };
-
-  // Sound play preview handler
+  // Sound preview handler
   const toggleSoundPreview = (type: SoundType) => {
     if (isPreviewingSound === type) {
       stopSound();
@@ -360,7 +492,7 @@ export default function App() {
 
     const newReminder: TaskReminder = {
       id: Math.random().toString(36).substring(2, 9),
-      title: labelName || `⚡ Quick Reminder (${minutes}m)`,
+      title: labelName || `⚡ Quick Trial (${minutes}m)`,
       date: qDate,
       time: qTime,
       dateTimeString: `${qDate} ${qTime}`,
@@ -524,11 +656,12 @@ export default function App() {
               <div>
                 <h1 className="text-xl font-extrabold tracking-tight text-slate-900 font-display flex items-center gap-2">
                   Task Reminders
-                  <span className="inline-flex items-center rounded-full bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-700 ring-1 ring-indigo-500/20">
-                    Pro
+                  <span className="inline-flex items-center gap-1 rounded-full bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-700 ring-1 ring-indigo-500/20">
+                    <Radio className="h-2.5 w-2.5 text-indigo-600 animate-pulse" />
+                    Web Push API
                   </span>
                 </h1>
-                <p className="text-xs font-medium text-slate-500">System popups & synthesized audio alarms</p>
+                <p className="text-xs font-medium text-slate-500">Express server background scheduler & OS Push notifications</p>
               </div>
             </div>
 
@@ -539,7 +672,7 @@ export default function App() {
               <button
                 onClick={handleOpenNewTab}
                 className="flex items-center gap-1.5 rounded-xl border border-indigo-200/80 bg-indigo-50/70 hover:bg-indigo-100/80 px-3 py-2 text-xs font-semibold text-indigo-700 transition-all cursor-pointer shadow-2xs hover:shadow-xs active:scale-95"
-                title="Open app in a full browser tab for system permissions"
+                title="Open app in a full browser tab for native Web Push API permissions"
               >
                 <ExternalLink className="h-3.5 w-3.5" />
                 <span>Open in Tab</span>
@@ -551,7 +684,7 @@ export default function App() {
                 className="flex items-center gap-1.5 rounded-xl border border-slate-200/80 bg-white hover:bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700 transition-all cursor-pointer shadow-2xs"
               >
                 <Laptop className="h-3.5 w-3.5 text-indigo-600" />
-                <span className="hidden sm:inline">Closed Window Guide</span>
+                <span className="hidden sm:inline">Closed Web Page Guide</span>
                 <span className="sm:hidden">Guide</span>
               </button>
 
@@ -570,7 +703,7 @@ export default function App() {
         </div>
       </header>
 
-      {/* SYSTEM PERMISSION & IFRAME ACTION BANNERS */}
+      {/* WEB PUSH API & IFRAME ACTION BANNERS */}
       <div className="mx-auto max-w-7xl px-4 pt-5 sm:px-6 lg:px-8">
         
         {/* Banner 1: If inside iFrame */}
@@ -586,9 +719,9 @@ export default function App() {
                   <ShieldAlert className="h-5 w-5" />
                 </div>
                 <div>
-                  <h3 className="font-bold text-amber-950 text-sm font-display">Browser Security Notice for Laptop Popups</h3>
+                  <h3 className="font-bold text-amber-950 text-sm font-display">Web Push API Security Notice</h3>
                   <p className="mt-0.5 text-xs text-amber-800/90 leading-relaxed max-w-2xl">
-                    You are currently viewing this inside an embedded frame. For security, web browsers block system notification popups inside embedded frames. Click below to launch in a full tab and receive real system popups on your laptop!
+                    You are currently viewing this inside an embedded preview frame. Browsers block native Web Push permissions inside embedded frames. Click below to open in a full tab to enable native Web Push API notifications when the web page is closed!
                   </p>
                 </div>
               </div>
@@ -603,35 +736,254 @@ export default function App() {
           </motion.div>
         )}
 
-        {/* Banner 2: Permission request if not granted and not in iframe */}
-        {!isInIframe && notificationPermission !== 'granted' && (
-          <motion.div 
-            initial={{ opacity: 0, y: -10 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="mb-4 rounded-2xl border border-indigo-200/80 bg-gradient-to-r from-indigo-50/90 via-violet-50/60 to-white p-4 shadow-sm"
-          >
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <div className="flex items-start gap-3">
-                <div className="rounded-xl bg-indigo-500/10 p-2 text-indigo-600">
-                  <BellRing className="h-5 w-5" />
-                </div>
-                <div>
-                  <h3 className="font-bold text-indigo-950 text-sm font-display">Enable Laptop System Notifications</h3>
-                  <p className="mt-0.5 text-xs text-indigo-800">
-                    Allow notifications so task alarms pop up directly on your desktop notification center even when working in other tabs.
-                  </p>
-                </div>
+        {/* Banner 2: WEB PUSH API ACTIVE CONTROL CARD */}
+        <div className="mb-6 rounded-2xl border border-indigo-200/90 bg-gradient-to-r from-indigo-900 via-slate-900 to-slate-950 text-white p-4 sm:p-5 shadow-lg shadow-indigo-950/20">
+          <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+            <div className="flex items-start gap-3.5">
+              <div className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl ${
+                isPushSubscribed 
+                  ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 ring-4 ring-emerald-500/10' 
+                  : 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/30'
+              }`}>
+                <Radio className={`h-5 w-5 ${isPushSubscribed ? 'animate-pulse' : ''}`} />
               </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <h3 className="font-bold text-white text-sm sm:text-base font-display">
+                    Web Push API Engine
+                  </h3>
+                  <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold tracking-wider uppercase border ${
+                    isPushSubscribed 
+                      ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' 
+                      : 'bg-slate-800 text-slate-400 border-slate-700'
+                  }`}>
+                    {isPushSubscribed ? '● Push Active (Closed-Page Ready)' : '○ Disabled'}
+                  </span>
+                </div>
+                <p className="mt-1 text-xs text-slate-300 leading-relaxed max-w-2xl">
+                  Uses the browser's native <strong>PushManager API</strong> & VAPID keys. Scheduled reminders are synced with the Express backend server, which delivers OS push notifications directly to your desktop even when this web page is completely closed!
+                </p>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2.5 shrink-0 pt-2 md:pt-0 border-t md:border-t-0 border-slate-800">
+              {/* Toggle Web Push */}
               <button
-                onClick={requestNotificationPermission}
-                className="flex shrink-0 items-center justify-center gap-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 px-4 py-2.5 text-xs font-semibold text-white shadow-sm transition-all cursor-pointer"
+                onClick={handleToggleWebPush}
+                disabled={isSubscribingPush}
+                className={`flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-xs font-bold transition-all cursor-pointer shadow-sm active:scale-95 ${
+                  isPushSubscribed
+                    ? 'bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700'
+                    : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-600/30'
+                }`}
               >
-                <Bell className="h-4 w-4" />
-                Allow Laptop Popups
+                {isSubscribingPush ? (
+                  <>
+                    <span className="h-3.5 w-3.5 rounded-full border-2 border-white/30 border-t-white animate-spin" />
+                    <span>Connecting Push...</span>
+                  </>
+                ) : isPushSubscribed ? (
+                  <>
+                    <X className="h-3.5 w-3.5" />
+                    <span>Disable Web Push</span>
+                  </>
+                ) : (
+                  <>
+                    <Zap className="h-3.5 w-3.5 text-amber-300" />
+                    <span>Enable Web Push API</span>
+                  </>
+                )}
+              </button>
+
+              {/* Test Server Web Push */}
+              <button
+                onClick={handleTestServerPush}
+                disabled={testPushLoading}
+                className="flex items-center justify-center gap-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 px-4 py-2.5 text-xs font-bold text-white shadow-sm transition-all cursor-pointer active:scale-95 disabled:opacity-50"
+                title="Sends a test push packet directly from Express server to browser Push daemon"
+              >
+                {testPushLoading ? (
+                  <span className="h-3.5 w-3.5 rounded-full border-2 border-white/30 border-t-white animate-spin" />
+                ) : (
+                  <Send className="h-3.5 w-3.5" />
+                )}
+                <span>Test Closed-Page Push</span>
+              </button>
+
+              {/* VAPID Credentials Settings Trigger */}
+              <button
+                onClick={() => {
+                  setShowInlineVapidConfig(!showInlineVapidConfig);
+                  if (!showInlineVapidConfig) handleOpenVapidModal();
+                }}
+                className={`flex items-center justify-center gap-2 rounded-xl px-3.5 py-2.5 text-xs font-bold transition-all cursor-pointer shadow-2xs active:scale-95 ${
+                  showInlineVapidConfig
+                    ? 'bg-indigo-600 text-white'
+                    : 'bg-slate-800/90 hover:bg-slate-700/90 text-indigo-300 border border-indigo-500/30 hover:text-white'
+                }`}
+                title="Enter custom VAPID public and private keys"
+              >
+                <Key className="h-3.5 w-3.5 text-indigo-300" />
+                <span>VAPID Keys Settings</span>
               </button>
             </div>
-          </motion.div>
-        )}
+          </div>
+
+          {/* Inline VAPID Public & Private Keys Configuration Panel */}
+          <AnimatePresence>
+            {showInlineVapidConfig && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: 'auto' }}
+                exit={{ opacity: 0, height: 0 }}
+                className="mt-4 pt-4 border-t border-slate-800"
+              >
+                <div className="rounded-2xl bg-slate-950/80 p-4 border border-slate-800 space-y-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Key className="h-4 w-4 text-indigo-400" />
+                      <h4 className="text-xs font-bold text-white uppercase tracking-wider font-display">
+                        Enter Custom VAPID Credentials
+                      </h4>
+                    </div>
+                    <span className="text-[10px] text-slate-400 font-mono">
+                      Active: {vapidForm.publicKey ? `${vapidForm.publicKey.substring(0, 12)}...` : 'Not Set'}
+                    </span>
+                  </div>
+
+                  {vapidFeedback && (
+                    <div className={`flex items-center gap-2 rounded-xl p-3 text-xs font-semibold ${
+                      vapidFeedback.type === 'success'
+                        ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+                        : 'bg-rose-500/15 text-rose-300 border border-rose-500/30'
+                    }`}>
+                      {vapidFeedback.type === 'success' ? (
+                        <ShieldCheck className="h-4 w-4 shrink-0 text-emerald-400" />
+                      ) : (
+                        <ShieldAlert className="h-4 w-4 shrink-0 text-rose-400" />
+                      )}
+                      <span>{vapidFeedback.msg}</span>
+                    </div>
+                  )}
+
+                  <form onSubmit={handleSaveVapidCredentials} className="space-y-3">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                          VAPID Public Key
+                        </label>
+                        <input
+                          type="text"
+                          value={vapidForm.publicKey}
+                          onChange={(e) => setVapidForm(prev => ({ ...prev, publicKey: e.target.value }))}
+                          placeholder="Paste Public Key..."
+                          required
+                          className="w-full rounded-xl border border-slate-800 bg-slate-900 px-3 py-2 text-xs font-mono text-indigo-200 placeholder:text-slate-600 focus:border-indigo-500 focus:outline-none"
+                        />
+                      </div>
+
+                      <div>
+                        <div className="flex items-center justify-between mb-1">
+                          <label className="block text-[11px] font-bold text-slate-300">
+                            VAPID Private Key
+                          </label>
+                          <button
+                            type="button"
+                            onClick={() => setShowPrivateKey(!showPrivateKey)}
+                            className="text-[10px] text-slate-400 hover:text-slate-200 flex items-center gap-1 cursor-pointer"
+                          >
+                            {showPrivateKey ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
+                            <span>{showPrivateKey ? 'Hide' : 'Show'}</span>
+                          </button>
+                        </div>
+                        <input
+                          type={showPrivateKey ? 'text' : 'password'}
+                          value={vapidForm.privateKey}
+                          onChange={(e) => setVapidForm(prev => ({ ...prev, privateKey: e.target.value }))}
+                          placeholder="Paste Private Key..."
+                          required
+                          className="w-full rounded-xl border border-slate-800 bg-slate-900 px-3 py-2 text-xs font-mono text-amber-200 placeholder:text-slate-600 focus:border-indigo-500 focus:outline-none"
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                        VAPID Subject (mailto: or URL)
+                      </label>
+                      <input
+                        type="text"
+                        value={vapidForm.subject}
+                        onChange={(e) => setVapidForm(prev => ({ ...prev, subject: e.target.value }))}
+                        placeholder="mailto:admin@example.com"
+                        required
+                        className="w-full rounded-xl border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-200 placeholder:text-slate-600 focus:border-indigo-500 focus:outline-none"
+                      />
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2 pt-1">
+                      <button
+                        type="submit"
+                        disabled={isSavingVapid}
+                        className="flex items-center gap-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 px-4 py-2 text-xs font-bold text-white shadow-sm transition-all cursor-pointer disabled:opacity-50"
+                      >
+                        {isSavingVapid ? (
+                          <span className="h-3.5 w-3.5 rounded-full border-2 border-white/30 border-t-white animate-spin" />
+                        ) : (
+                          <Save className="h-3.5 w-3.5" />
+                        )}
+                        <span>Save & Apply Keys</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleGenerateNewKeys}
+                        disabled={isSavingVapid}
+                        className="flex items-center gap-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 px-3 py-2 text-xs font-semibold transition-all cursor-pointer disabled:opacity-50"
+                      >
+                        <RefreshCw className={`h-3.5 w-3.5 text-amber-400 ${isSavingVapid ? 'animate-spin' : ''}`} />
+                        <span>Auto-Generate Keypair</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleCopyEnvBlock}
+                        className="flex items-center gap-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 px-3 py-2 text-xs font-semibold transition-all cursor-pointer"
+                      >
+                        {copiedField === 'envBlock' ? (
+                          <>
+                            <Check className="h-3.5 w-3.5 text-emerald-400" />
+                            <span className="text-emerald-400 font-bold">Copied .env!</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="h-3.5 w-3.5 text-indigo-400" />
+                            <span>Copy .env Format</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </form>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Status Message feedback banner */}
+          <AnimatePresence>
+            {pushStatusMessage && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: 'auto' }}
+                exit={{ opacity: 0, height: 0 }}
+                className="mt-3.5 pt-3 border-t border-slate-800 text-xs font-semibold text-indigo-300 flex items-center gap-2"
+              >
+                <Sparkles className="h-3.5 w-3.5 text-amber-400 shrink-0" />
+                <span>{pushStatusMessage}</span>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
 
       </div>
 
@@ -723,17 +1075,15 @@ export default function App() {
                     <label htmlFor="task-date" className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">
                       Scheduled Date
                     </label>
-                    <div className="relative">
-                      <input
-                        id="task-date"
-                        type="date"
-                        required
-                        value={taskDate}
-                        min={getLocalDateString(new Date())}
-                        onChange={(e) => setTaskDate(e.target.value)}
-                        className="w-full rounded-2xl border border-slate-200/90 bg-slate-50/50 px-3.5 py-2.5 text-xs font-medium text-slate-800 outline-none transition-all focus:border-indigo-500 focus:bg-white focus:ring-4 focus:ring-indigo-500/10"
-                      />
-                    </div>
+                    <input
+                      id="task-date"
+                      type="date"
+                      required
+                      value={taskDate}
+                      min={getLocalDateString(new Date())}
+                      onChange={(e) => setTaskDate(e.target.value)}
+                      className="w-full rounded-2xl border border-slate-200/90 bg-slate-50/50 px-3.5 py-2.5 text-xs font-medium text-slate-800 outline-none transition-all focus:border-indigo-500 focus:bg-white focus:ring-4 focus:ring-indigo-500/10"
+                    />
                   </div>
 
                   <div>
@@ -883,29 +1233,29 @@ export default function App() {
               <div className="flex items-center gap-2 mb-2">
                 <Sparkles className="h-4 w-4 text-indigo-600" />
                 <h3 className="text-xs font-bold uppercase tracking-wider text-indigo-950 font-display">
-                  Instant Test Trial Presets
+                  Instant Web Push Trial Presets
                 </h3>
               </div>
               <p className="text-xs text-slate-500 mb-3.5 leading-relaxed">
-                Add an immediate trial reminder in 1 or 2 minutes to test desktop notification popups and speaker volume.
+                Set a trial reminder for 1 or 2 minutes, then close this browser tab! The Express server will trigger a Web Push notification to your OS.
               </p>
               <div className="grid grid-cols-3 gap-2">
                 <button
-                  onClick={() => addQuickPreset(1, '⚡ Trial Alarm (1 Min)')}
+                  onClick={() => addQuickPreset(1, '⚡ Trial Push Alarm (1 Min)')}
                   className="flex items-center justify-center gap-1.5 rounded-2xl bg-white border border-indigo-200/80 hover:border-indigo-400 px-2 py-2.5 text-xs font-bold text-indigo-700 shadow-2xs hover:shadow-xs transition-all cursor-pointer active:scale-95"
                 >
                   <Plus className="h-3 w-3" />
                   In 1 min
                 </button>
                 <button
-                  onClick={() => addQuickPreset(2, '⚡ Trial Alarm (2 Min)')}
+                  onClick={() => addQuickPreset(2, '⚡ Trial Push Alarm (2 Min)')}
                   className="flex items-center justify-center gap-1.5 rounded-2xl bg-white border border-indigo-200/80 hover:border-indigo-400 px-2 py-2.5 text-xs font-bold text-indigo-700 shadow-2xs hover:shadow-xs transition-all cursor-pointer active:scale-95"
                 >
                   <Plus className="h-3 w-3" />
                   In 2 min
                 </button>
                 <button
-                  onClick={() => addQuickPreset(5, '⚡ Trial Alarm (5 Min)')}
+                  onClick={() => addQuickPreset(5, '⚡ Trial Push Alarm (5 Min)')}
                   className="flex items-center justify-center gap-1.5 rounded-2xl bg-white border border-indigo-200/80 hover:border-indigo-400 px-2 py-2.5 text-xs font-bold text-indigo-700 shadow-2xs hover:shadow-xs transition-all cursor-pointer active:scale-95"
                 >
                   <Plus className="h-3 w-3" />
@@ -1088,7 +1438,7 @@ export default function App() {
                                       ? 'bg-rose-100 text-rose-800 animate-pulse'
                                       : relativeTime.isUrgent
                                         ? 'bg-amber-100 text-amber-800'
-                                        : 'bg-indigo-50 text-indigo-700'
+                                        : 'bg-slate-100 text-slate-600'
                                 }`}>
                                   {relativeTime.text}
                                 </span>
@@ -1097,43 +1447,38 @@ export default function App() {
                             </div>
                           </div>
 
-                          {/* Toolbar Actions */}
+                          {/* Actions */}
                           <div className="flex items-center gap-1 shrink-0">
-                            
-                            {/* Test Sound Button */}
                             {!reminder.completed && (
                               <button
                                 onClick={() => {
                                   playSound(reminder.soundType);
                                   setActiveAlarm(reminder);
                                 }}
-                                className="flex h-8 w-8 items-center justify-center rounded-xl bg-slate-50 hover:bg-indigo-50 text-indigo-600 transition-all cursor-pointer"
-                                title="Test Alarm Trigger Now"
+                                className="opacity-0 group-hover:opacity-100 flex h-7 w-7 items-center justify-center rounded-lg hover:bg-slate-100 text-indigo-600 transition-all cursor-pointer"
+                                title="Trigger Sound Alarm Now"
                               >
                                 <Play className="h-3.5 w-3.5" />
                               </button>
                             )}
 
-                            {/* Edit Button */}
                             {!reminder.completed && (
                               <button
                                 onClick={() => startEditing(reminder)}
-                                className="flex h-8 w-8 items-center justify-center rounded-xl hover:bg-slate-100 text-slate-500 hover:text-indigo-600 transition-all cursor-pointer"
-                                title="Edit task"
+                                className="flex h-7 w-7 items-center justify-center rounded-lg hover:bg-slate-100 text-slate-500 hover:text-indigo-600 transition-all cursor-pointer"
+                                title="Edit reminder details"
                               >
                                 <Edit2 className="h-3.5 w-3.5" />
                               </button>
                             )}
 
-                            {/* Delete Button */}
                             <button
                               onClick={() => deleteReminder(reminder.id)}
-                              className="flex h-8 w-8 items-center justify-center rounded-xl hover:bg-rose-50 text-slate-400 hover:text-rose-600 transition-all cursor-pointer"
+                              className="flex h-7 w-7 items-center justify-center rounded-lg hover:bg-rose-50 text-slate-400 hover:text-rose-600 transition-all cursor-pointer"
                               title="Delete task"
                             >
                               <Trash2 className="h-3.5 w-3.5" />
                             </button>
-
                           </div>
 
                         </div>
@@ -1144,16 +1489,16 @@ export default function App() {
                   <motion.div 
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
-                    className="flex flex-col items-center justify-center rounded-3xl border-2 border-dashed border-slate-200/90 bg-white/60 p-12 text-center"
+                    className="flex flex-col items-center justify-center rounded-3xl border-2 border-dashed border-slate-200/80 bg-white/50 px-4 py-16 text-center"
                   >
-                    <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-600">
-                      <Bell className="h-7 w-7" />
+                    <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-500">
+                      <Bell className="h-6 w-6" />
                     </div>
-                    <h3 className="mt-4 font-bold text-slate-800 text-base font-display">No Reminders Found</h3>
-                    <p className="mt-1 text-xs text-slate-500 max-w-sm leading-relaxed">
+                    <h3 className="mt-4 font-bold text-slate-800 font-display">No Reminders Found</h3>
+                    <p className="mt-1 text-xs text-slate-400 max-w-sm">
                       {searchQuery 
-                        ? 'No tasks match your current search filter. Try clearing your parameters!' 
-                        : 'You do not have any scheduled reminders yet. Use the form on the left to set one or try a quick trial preset!'}
+                        ? 'No tasks match your search query.' 
+                        : 'No reminders in this view. Set a reminder above to test Web Push API notifications!'}
                     </p>
                   </motion.div>
                 )}
@@ -1164,34 +1509,260 @@ export default function App() {
         </div>
       </main>
 
-      {/* CLOSED WINDOW GUIDE MODAL */}
+      {/* MODAL: VAPID CREDENTIALS SETTINGS */}
+      <AnimatePresence>
+        {showVapidModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-xs p-4 overflow-y-auto"
+          >
+            <motion.div
+              initial={{ scale: 0.95, y: 10 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 10 }}
+              className="relative w-full max-w-xl my-8 overflow-hidden rounded-3xl bg-slate-900 text-white p-6 shadow-2xl border border-slate-800"
+            >
+              <div className="flex items-center justify-between border-b border-slate-800 pb-4">
+                <div className="flex items-center gap-3">
+                  <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-indigo-500/20 text-indigo-400 border border-indigo-500/30">
+                    <Key className="h-5 w-5" />
+                  </div>
+                  <div>
+                    <h3 className="font-bold text-white font-display text-base flex items-center gap-2">
+                      VAPID Key Credentials
+                      <span className="rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-semibold px-2 py-0.5 border border-emerald-500/30">
+                        Active Server Keys
+                      </span>
+                    </h3>
+                    <p className="text-xs text-slate-400">Enter custom keys or auto-generate keypair for Web Push API</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setShowVapidModal(false)}
+                  className="rounded-xl p-1.5 text-slate-400 hover:bg-slate-800 hover:text-slate-200 cursor-pointer transition-all"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+
+              {/* Feedback Alert */}
+              {vapidFeedback && (
+                <div className={`mt-4 flex items-center gap-2.5 rounded-2xl p-3.5 text-xs font-semibold ${
+                  vapidFeedback.type === 'success'
+                    ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+                    : 'bg-rose-500/15 text-rose-300 border border-rose-500/30'
+                }`}>
+                  {vapidFeedback.type === 'success' ? (
+                    <ShieldCheck className="h-4 w-4 shrink-0 text-emerald-400" />
+                  ) : (
+                    <ShieldAlert className="h-4 w-4 shrink-0 text-rose-400" />
+                  )}
+                  <span>{vapidFeedback.msg}</span>
+                </div>
+              )}
+
+              <form onSubmit={handleSaveVapidCredentials} className="mt-5 space-y-4">
+                
+                {/* VAPID Public Key */}
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="text-xs font-bold text-slate-300 flex items-center gap-1.5">
+                      <span>VAPID Public Key</span>
+                      <span className="text-[10px] text-slate-500 font-normal">(Client pushManager key)</span>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => handleCopyText(vapidForm.publicKey, 'publicKey')}
+                      className="text-[11px] font-semibold text-indigo-400 hover:text-indigo-300 flex items-center gap-1 cursor-pointer"
+                    >
+                      {copiedField === 'publicKey' ? (
+                        <>
+                          <Check className="h-3 w-3 text-emerald-400" />
+                          <span className="text-emerald-400">Copied!</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="h-3 w-3" />
+                          <span>Copy</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                  <input
+                    type="text"
+                    value={vapidForm.publicKey}
+                    onChange={(e) => setVapidForm(prev => ({ ...prev, publicKey: e.target.value }))}
+                    placeholder="Enter VAPID Public Key..."
+                    required
+                    className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 py-2.5 text-xs font-mono text-indigo-200 placeholder:text-slate-600 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  />
+                </div>
+
+                {/* VAPID Private Key */}
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="text-xs font-bold text-slate-300 flex items-center gap-1.5">
+                      <span>VAPID Private Key</span>
+                      <span className="text-[10px] text-rose-400 font-normal">(Keep secret)</span>
+                    </label>
+                    <div className="flex items-center gap-3">
+                      <button
+                        type="button"
+                        onClick={() => setShowPrivateKey(!showPrivateKey)}
+                        className="text-[11px] font-semibold text-slate-400 hover:text-slate-200 flex items-center gap-1 cursor-pointer"
+                      >
+                        {showPrivateKey ? (
+                          <>
+                            <EyeOff className="h-3 w-3" />
+                            <span>Hide</span>
+                          </>
+                        ) : (
+                          <>
+                            <Eye className="h-3 w-3" />
+                            <span>Show</span>
+                          </>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleCopyText(vapidForm.privateKey, 'privateKey')}
+                        className="text-[11px] font-semibold text-indigo-400 hover:text-indigo-300 flex items-center gap-1 cursor-pointer"
+                      >
+                        {copiedField === 'privateKey' ? (
+                          <>
+                            <Check className="h-3 w-3 text-emerald-400" />
+                            <span className="text-emerald-400">Copied!</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="h-3 w-3" />
+                            <span>Copy</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                  <input
+                    type={showPrivateKey ? 'text' : 'password'}
+                    value={vapidForm.privateKey}
+                    onChange={(e) => setVapidForm(prev => ({ ...prev, privateKey: e.target.value }))}
+                    placeholder="Enter VAPID Private Key..."
+                    required
+                    className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 py-2.5 text-xs font-mono text-amber-200 placeholder:text-slate-600 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  />
+                </div>
+
+                {/* Subject / Contact Email */}
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="text-xs font-bold text-slate-300">VAPID Subject (mailto: or URL)</label>
+                    <button
+                      type="button"
+                      onClick={() => handleCopyText(vapidForm.subject, 'subject')}
+                      className="text-[11px] font-semibold text-indigo-400 hover:text-indigo-300 flex items-center gap-1 cursor-pointer"
+                    >
+                      {copiedField === 'subject' ? (
+                        <>
+                          <Check className="h-3 w-3 text-emerald-400" />
+                          <span className="text-emerald-400">Copied!</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="h-3 w-3" />
+                          <span>Copy</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                  <input
+                    type="text"
+                    value={vapidForm.subject}
+                    onChange={(e) => setVapidForm(prev => ({ ...prev, subject: e.target.value }))}
+                    placeholder="mailto:admin@example.com"
+                    required
+                    className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 py-2.5 text-xs text-slate-200 placeholder:text-slate-600 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  />
+                </div>
+
+                {/* Submit & Secondary Action Buttons */}
+                <div className="pt-3 border-t border-slate-800 space-y-2.5">
+                  <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
+                    <button
+                      type="submit"
+                      disabled={isSavingVapid}
+                      className="flex-1 flex items-center justify-center gap-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 px-4 py-3 text-xs font-bold text-white shadow-md shadow-indigo-950/40 transition-all cursor-pointer disabled:opacity-50"
+                    >
+                      {isSavingVapid ? (
+                        <span className="h-3.5 w-3.5 rounded-full border-2 border-white/30 border-t-white animate-spin" />
+                      ) : (
+                        <Save className="h-4 w-4" />
+                      )}
+                      <span>Save & Apply Credentials</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={handleGenerateNewKeys}
+                      disabled={isSavingVapid}
+                      className="flex items-center justify-center gap-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 px-3.5 py-3 text-xs font-semibold transition-all cursor-pointer disabled:opacity-50"
+                      title="Auto-generates a new VAPID keypair"
+                    >
+                      <RefreshCw className={`h-3.5 w-3.5 text-amber-400 ${isSavingVapid ? 'animate-spin' : ''}`} />
+                      <span>Auto-Generate Keys</span>
+                    </button>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleCopyEnvBlock}
+                    className="w-full flex items-center justify-center gap-2 rounded-xl bg-slate-950 hover:bg-slate-800 text-slate-300 border border-slate-800 py-2.5 text-xs font-semibold transition-all cursor-pointer"
+                  >
+                    {copiedField === 'envBlock' ? (
+                      <>
+                        <Check className="h-3.5 w-3.5 text-emerald-400" />
+                        <span className="text-emerald-400 font-bold">.env block copied to clipboard!</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="h-3.5 w-3.5 text-indigo-400" />
+                        <span>Copy .env Format Block</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </form>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* MODAL: CLOSED WEB PAGE & WEB PUSH GUIDE */}
       <AnimatePresence>
         {showClosedGuide && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 backdrop-blur-sm p-4"
+            className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 backdrop-blur-xs p-4"
           >
             <motion.div
-              initial={{ scale: 0.95, y: 15 }}
+              initial={{ scale: 0.95, y: 10 }}
               animate={{ scale: 1, y: 0 }}
-              exit={{ scale: 0.95, y: 15 }}
-              className="relative w-full max-w-lg overflow-hidden rounded-3xl bg-white p-6 shadow-2xl border border-slate-200 text-slate-900"
+              exit={{ scale: 0.95, y: 10 }}
+              className="relative w-full max-w-xl overflow-hidden rounded-3xl bg-white p-6 shadow-2xl border border-slate-200 text-slate-900"
             >
               <div className="flex items-center justify-between border-b border-slate-100 pb-4">
                 <div className="flex items-center gap-2.5">
-                  <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600">
-                    <Laptop className="h-5 w-5" />
+                  <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600">
+                    <Radio className="h-4 w-4" />
                   </div>
-                  <div>
-                    <h3 className="font-bold text-slate-900 font-display text-base">Closed Window Notification Guide</h3>
-                    <p className="text-[11px] text-slate-500">How to receive alerts on your laptop screen</p>
-                  </div>
+                  <h3 className="font-bold text-slate-900 font-display text-base">How Web Push Works When Page is Closed</h3>
                 </div>
                 <button
                   onClick={() => setShowClosedGuide(false)}
-                  className="rounded-xl p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-600 cursor-pointer"
+                  className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600 cursor-pointer"
                 >
                   <X className="h-5 w-5" />
                 </button>
@@ -1199,47 +1770,55 @@ export default function App() {
 
               <div className="mt-4 space-y-3.5 text-xs text-slate-600 leading-relaxed">
                 <p>
-                  Web browsers suspend client scripts when a window is completely closed. Here are 3 guaranteed ways to ensure you get your task alerts:
+                  Standard client scripts stop when a web page is closed. The <strong>W3C Web Push API</strong> solves this completely using standard browser infrastructure:
                 </p>
 
-                <div className="rounded-2xl border border-indigo-100 bg-indigo-50/40 p-4 space-y-1.5">
-                  <div className="flex items-center gap-2 font-bold text-indigo-950 font-display text-sm">
+                <div className="rounded-2xl border border-indigo-100 bg-indigo-50/50 p-3.5 space-y-1.5">
+                  <div className="flex items-center gap-2 font-bold text-indigo-950">
                     <span className="flex h-5 w-5 items-center justify-center rounded-full bg-indigo-600 text-white text-[10px]">1</span>
-                    <span>Open in Standalone Browser Tab</span>
+                    <span>Server-Side VAPID Keys & Push Service</span>
                   </div>
                   <p className="pl-7 text-slate-600">
-                    Click <strong>"Open in Tab"</strong> at the top header bar. Allow notifications once so your OS can send native popups even when you are working on other applications.
+                    When you click <strong>Enable Web Push API</strong>, your browser registers a unique Push Subscription endpoint with Google (FCM), Apple (APNs), or Mozilla Push Service.
                   </p>
                 </div>
 
-                <div className="rounded-2xl border border-indigo-100 bg-indigo-50/40 p-4 space-y-1.5">
-                  <div className="flex items-center gap-2 font-bold text-indigo-950 font-display text-sm">
+                <div className="rounded-2xl border border-indigo-100 bg-indigo-50/50 p-3.5 space-y-1.5">
+                  <div className="flex items-center gap-2 font-bold text-indigo-950">
                     <span className="flex h-5 w-5 items-center justify-center rounded-full bg-indigo-600 text-white text-[10px]">2</span>
-                    <span>Background Service Worker Sync</span>
+                    <span>Express Server Background Scheduler</span>
                   </div>
                   <p className="pl-7 text-slate-600">
-                    This application installs a <strong>Background Service Worker</strong> and <strong>IndexedDB database</strong>. As long as your browser application (Chrome/Edge/Safari/Brave) is open in the background, notifications fire automatically!
+                    Our Express backend checks scheduled tasks in the background. When a task is due, the server transmits a Web Push packet directly to your browser's push service endpoint.
                   </p>
                 </div>
 
-                <div className="rounded-2xl border border-indigo-100 bg-indigo-50/40 p-4 space-y-1.5">
-                  <div className="flex items-center gap-2 font-bold text-indigo-950 font-display text-sm">
+                <div className="rounded-2xl border border-indigo-100 bg-indigo-50/50 p-3.5 space-y-1.5">
+                  <div className="flex items-center gap-2 font-bold text-indigo-950">
                     <span className="flex h-5 w-5 items-center justify-center rounded-full bg-indigo-600 text-white text-[10px]">3</span>
-                    <span>Install as Laptop Desktop App (PWA)</span>
+                    <span>OS System Notification Delivery</span>
                   </div>
                   <p className="pl-7 text-slate-600">
-                    Use your browser's address bar icon or click below to install Task Reminders directly to your Mac Dock or Windows Start Menu as a native app.
+                    Your operating system's native push daemon wakes up the Service Worker in the background and displays a system popup notification on your screen—even if the web page is closed!
                   </p>
                 </div>
               </div>
 
-              <div className="mt-6 flex items-center justify-end gap-2">
+              <div className="mt-6 flex items-center justify-between gap-2 border-t border-slate-100 pt-4">
+                <button
+                  onClick={handleTestServerPush}
+                  className="flex items-center gap-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 px-3.5 py-2 text-xs font-bold text-white transition-all cursor-pointer"
+                >
+                  <Send className="h-3.5 w-3.5" />
+                  Test Push Now
+                </button>
+
                 <button
                   onClick={handleOpenNewTab}
-                  className="flex items-center gap-1.5 rounded-2xl bg-indigo-600 hover:bg-indigo-700 px-4 py-2.5 text-xs font-bold text-white shadow-md shadow-indigo-600/20 transition-all cursor-pointer"
+                  className="flex items-center gap-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 px-4 py-2 text-xs font-bold text-white transition-all cursor-pointer"
                 >
                   <ExternalLink className="h-3.5 w-3.5" />
-                  Open Standalone App Now
+                  Open Standalone Tab
                 </button>
               </div>
             </motion.div>
@@ -1247,88 +1826,81 @@ export default function App() {
         )}
       </AnimatePresence>
 
-      {/* FULL-SCREEN ACTIVE ALARM OVERLAY */}
+      {/* FULL-SCREEN ACTIVE ALARM DIALOG OVERLAY */}
       <AnimatePresence>
         {activeAlarm && (
           <motion.div 
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/85 backdrop-blur-xl p-4"
+            className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-md p-4"
           >
             <motion.div 
               initial={{ scale: 0.9, y: 20 }}
               animate={{ scale: 1, y: 0 }}
               exit={{ scale: 0.9, y: 20 }}
-              className="relative w-full max-w-md overflow-hidden rounded-3xl border border-indigo-500/30 bg-slate-900 text-white p-7 shadow-2xl shadow-indigo-950/60"
+              className="relative w-full max-w-md overflow-hidden rounded-3xl border border-indigo-500/20 bg-slate-900 text-white p-6 shadow-2xl shadow-indigo-950/50"
             >
-              
-              {/* Radiating Ping Waves */}
               <div className="absolute top-0 left-1/2 -translate-x-1/2 h-1/2 w-full flex items-center justify-center overflow-hidden pointer-events-none">
-                <div className="absolute h-56 w-56 rounded-full border border-indigo-500/15 animate-ping" />
-                <div className="absolute h-40 w-40 rounded-full border border-indigo-500/25 animate-ping [animation-delay:0.3s]" />
-                <div className="absolute h-28 w-28 rounded-full border border-indigo-500/35 animate-ping [animation-delay:0.6s]" />
+                <div className="absolute h-48 w-48 rounded-full border border-indigo-500/10 animate-ping" />
+                <div className="absolute h-36 w-36 rounded-full border border-indigo-500/20 animate-ping [animation-delay:0.3s]" />
+                <div className="absolute h-24 w-24 rounded-full border border-indigo-500/30 animate-ping [animation-delay:0.6s]" />
               </div>
 
-              <div className="relative text-center mt-4">
-                
-                {/* Alarm Icon */}
-                <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-indigo-600/30 border border-indigo-500 text-indigo-400 animate-bounce shadow-lg shadow-indigo-500/30">
-                  <BellRing className="h-10 w-10" />
+              <div className="relative text-center mt-6">
+                <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-indigo-600/30 border border-indigo-500 text-indigo-400 animate-bounce">
+                  <BellRing className="h-8 w-8" />
                 </div>
                 
-                <h2 className="mt-5 text-xs font-bold uppercase tracking-widest text-indigo-400 font-display">
+                <h2 className="mt-4 text-xs font-bold uppercase tracking-widest text-indigo-400">
                   Task Reminder Due
                 </h2>
                 
-                <h3 className="mt-2 text-2xl font-extrabold tracking-tight px-2 leading-snug font-display">
+                <h3 className="mt-2 text-2xl font-bold tracking-tight px-4 leading-snug">
                   {activeAlarm.title}
                 </h3>
 
-                <p className="mt-2 font-mono text-xs text-indigo-200 bg-slate-800/80 py-1 px-3 rounded-full w-max mx-auto">
-                  Scheduled: {activeAlarm.date} • {activeAlarm.time}
+                <p className="mt-1.5 font-mono text-sm text-indigo-300">
+                  Scheduled time: {activeAlarm.date} • {activeAlarm.time}
                 </p>
               </div>
 
-              {/* Sound Indicator */}
-              <div className="relative mt-5 flex items-center justify-center gap-2 text-xs text-slate-300 bg-slate-800/50 py-2 px-4 rounded-xl w-max mx-auto border border-slate-700/50">
-                <Volume2 className="h-4 w-4 text-indigo-400 animate-pulse" />
-                <span>Ringing <strong>{activeAlarm.soundType}</strong> sound...</span>
+              <div className="relative mt-4 flex items-center justify-center gap-1.5 text-xs text-slate-400 bg-slate-800/40 py-1.5 px-3 rounded-lg w-max mx-auto">
+                <Volume2 className="h-3.5 w-3.5 text-indigo-400" />
+                <span>Ringing <strong>{activeAlarm.soundType}</strong> tone...</span>
               </div>
 
-              {/* Actions */}
               <div className="relative mt-8 space-y-3">
                 <button
                   onClick={handleDismissComplete}
-                  className="flex w-full items-center justify-center gap-2 rounded-2xl bg-emerald-600 hover:bg-emerald-500 px-4 py-3.5 font-bold text-white shadow-lg shadow-emerald-950/40 transition-all cursor-pointer active:scale-98"
+                  className="flex w-full items-center justify-center gap-2 rounded-2xl bg-emerald-600 hover:bg-emerald-500 px-4 py-3.5 font-semibold text-white shadow-lg shadow-emerald-950/40 transition-all cursor-pointer active:scale-98"
                 >
                   <CheckCircle className="h-5 w-5" />
-                  Dismiss & Mark Complete
+                  Dismiss & Mark Completed
                 </button>
 
                 <div className="grid grid-cols-2 gap-2">
                   <button
                     onClick={() => handleSnooze(5)}
-                    className="flex items-center justify-center gap-1 rounded-xl bg-slate-800/80 hover:bg-slate-700/80 px-4 py-3 text-xs font-bold text-amber-400 border border-amber-400/20 transition-all cursor-pointer active:scale-98"
+                    className="flex items-center justify-center gap-1.5 rounded-xl border border-slate-700 bg-slate-800 hover:bg-slate-700 px-3 py-2.5 text-xs font-semibold text-slate-200 transition-all cursor-pointer"
                   >
-                    Snooze 5 Min
+                    Snooze 5 mins
                   </button>
                   <button
                     onClick={() => handleSnooze(15)}
-                    className="flex items-center justify-center gap-1 rounded-xl bg-slate-800/80 hover:bg-slate-700/80 px-4 py-3 text-xs font-bold text-amber-400 border border-amber-400/20 transition-all cursor-pointer active:scale-98"
+                    className="flex items-center justify-center gap-1.5 rounded-xl border border-slate-700 bg-slate-800 hover:bg-slate-700 px-3 py-2.5 text-xs font-semibold text-slate-200 transition-all cursor-pointer"
                   >
-                    Snooze 15 Min
+                    Snooze 15 mins
                   </button>
                 </div>
 
                 <button
                   onClick={handleStopOnly}
-                  className="flex w-full items-center justify-center gap-1 rounded-xl bg-slate-800/60 hover:bg-slate-800 text-xs font-semibold text-slate-400 transition-all cursor-pointer py-2.5"
+                  className="w-full text-center text-xs text-slate-400 hover:text-white pt-1 cursor-pointer"
                 >
-                  Silence Alarm Tone (Keep Pending)
+                  Stop sound without marking done
                 </button>
               </div>
-
             </motion.div>
           </motion.div>
         )}
