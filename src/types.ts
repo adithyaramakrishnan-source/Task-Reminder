@@ -8,6 +8,10 @@ export interface TaskReminder {
   notified: boolean;
   createdAt: string;
   soundType: 'digital' | 'classic' | 'bell' | 'gentle';
+  category?: 'Work' | 'Personal' | 'Health' | 'Urgent' | 'General';
+  priority?: 'high' | 'medium' | 'low';
 }
 
 export type SoundType = 'digital' | 'classic' | 'bell' | 'gentle';
+export type TaskCategory = 'Work' | 'Personal' | 'Health' | 'Urgent' | 'General';
+export type TaskPriority = 'high' | 'medium' | 'low';
